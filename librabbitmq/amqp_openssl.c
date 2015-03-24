@@ -78,7 +78,7 @@ struct amqp_ssl_socket_t {
 static ssize_t
 amqp_ssl_socket_send(void *base,
                      const void *buf,
-                     size_t len)
+                     size_t len, struct timeval *timeout)
 {
   struct amqp_ssl_socket_t *self = (struct amqp_ssl_socket_t *)base;
   ssize_t res;
@@ -115,7 +115,8 @@ amqp_ssl_socket_send(void *base,
 static ssize_t
 amqp_ssl_socket_writev(void *base,
                        struct iovec *iov,
-                       int iovcnt)
+                       int iovcnt,
+                       struct timeval *timeout)
 {
   struct amqp_ssl_socket_t *self = (struct amqp_ssl_socket_t *)base;
   ssize_t ret = -1;
@@ -144,7 +145,7 @@ amqp_ssl_socket_writev(void *base,
     memcpy(bufferp, iov[i].iov_base, iov[i].iov_len);
     bufferp += iov[i].iov_len;
   }
-  ret = amqp_ssl_socket_send(self, self->buffer, bytes);
+  ret = amqp_ssl_socket_send(self, self->buffer, bytes, NULL);
 exit:
   return ret;
 }
@@ -153,7 +154,8 @@ static ssize_t
 amqp_ssl_socket_recv(void *base,
                      void *buf,
                      size_t len,
-                     AMQP_UNUSED int flags)
+                     AMQP_UNUSED int flags,
+                     struct timeval *timeout)
 {
   struct amqp_ssl_socket_t *self = (struct amqp_ssl_socket_t *)base;
   ssize_t received;

@@ -43,9 +43,9 @@ int
 amqp_os_socket_close(int sockfd);
 
 /* Socket callbacks. */
-typedef ssize_t (*amqp_socket_writev_fn)(void *, struct iovec *, int);
-typedef ssize_t (*amqp_socket_send_fn)(void *, const void *, size_t);
-typedef ssize_t (*amqp_socket_recv_fn)(void *, void *, size_t, int);
+typedef ssize_t (*amqp_socket_writev_fn)(void *, struct iovec *, int, struct timeval *);
+typedef ssize_t (*amqp_socket_send_fn)(void *, const void *, size_t, struct timeval *);
+typedef ssize_t (*amqp_socket_recv_fn)(void *, void *, size_t, int, struct timeval *);
 typedef int (*amqp_socket_open_fn)(void *, const char *, int, struct timeval *);
 typedef int (*amqp_socket_close_fn)(void *);
 typedef int (*amqp_socket_get_sockfd_fn)(void *);

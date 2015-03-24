@@ -27,10 +27,30 @@
 
 #include "amqp_private.h"
 #include "amqp_tcp_socket.h"
+#include "amqp_timer.h"
 
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#ifdef _WIN32
+# ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+# endif
+# include <Winsock2.h>
+# include <ws2tcpip.h>
+#else
+# include <sys/types.h>      /* On older BSD this must come before net includes */
+# include <netinet/in.h>
+# include <netinet/tcp.h>
+# include <sys/socket.h>
+# include <netdb.h>
+# include <sys/uio.h>
+# include <fcntl.h>
+# include <poll.h>
+# include <unistd.h>
+#endif
+
 
 struct amqp_tcp_socket_t {
   const struct amqp_socket_class_t *klass;
@@ -38,16 +58,19 @@ struct amqp_tcp_socket_t {
   void *buffer;
   size_t buffer_length;
   int internal_error;
+  int send_timeout;
+  int recv_timeout;
 };
 
 
 static ssize_t
-amqp_tcp_socket_send_inner(void *base, const void *buf, size_t len, int flags)
+amqp_tcp_socket_send_inner(void *base, const void *buf, size_t len, int flags, struct timeval *timeout)
 {
   struct amqp_tcp_socket_t *self = (struct amqp_tcp_socket_t *)base;
   ssize_t res;
   const char *buf_left = buf;
   ssize_t len_left = len;
+  int last_error;
 
   if (-1 == self->sockfd) {
     return AMQP_STATUS_SOCKET_CLOSED;
@@ -57,24 +80,61 @@ amqp_tcp_socket_send_inner(void *base, const void *buf, size_t len, int flags)
   flags |= MSG_NOSIGNAL;
 #endif
 
-start:
-  res = send(self->sockfd, buf_left, len_left, flags);
+  while(1) {
+    struct pollfd pfd;
+    int timeout_ms = -1;
 
-  if (res < 0) {
-    self->internal_error = amqp_os_socket_error();
-    if (EINTR == self->internal_error) {
-      goto start;
-    } else {
-      res = AMQP_STATUS_SOCKET_ERROR;
-    }
-  } else {
+    res = send(self->sockfd, buf_left, len_left, flags);
+
     if (res == len_left) {
       self->internal_error = 0;
       res = AMQP_STATUS_OK;
-    } else {
+      break;
+    } else if (res > 0) {
       buf_left += res;
       len_left -= res;
-      goto start;
+    } else if (0 == res) {
+      return AMQP_STATUS_TIMEOUT;
+    } else if (res < 0) {
+      last_error = errno;
+      if (EWOULDBLOCK == last_error || EAGAIN == last_error) {
+        pfd.fd = self->sockfd;
+        pfd.events = POLLERR | POLLOUT;
+        pfd.revents = 0;
+
+        if (timeout) {
+          timeout_ms = timeout->tv_sec * AMQP_MS_PER_S +
+                timeout->tv_usec / AMQP_US_PER_MS;
+        }
+
+        res = poll(&pfd, 1, timeout_ms);
+        if (0 > res) {
+          return AMQP_STATUS_SOCKET_ERROR;
+        } else if (0 == res) {
+          return AMQP_STATUS_TIMEOUT;
+        }
+/* TODO: heartbeats?
+        if (timeout) {
+            uint64_t end_timestamp;
+            uint64_t time_left;
+            uint64_t current_timestamp = amqp_get_monotonic_timestamp();
+            if (0 == current_timestamp) {
+                return AMQP_STATUS_TIMER_FAILURE;
+            }
+            end_timestamp = start +
+                (uint64_t)timeout->tv_sec * AMQP_NS_PER_S +
+                (uint64_t)timeout->tv_usec * AMQP_NS_PER_US;
+            if (current_timestamp > end_timestamp) {
+                return AMQP_STATUS_TIMEOUT;
+            }
+
+            time_left = end_timestamp - current_timestamp;
+
+            timeout->tv_sec = time_left / AMQP_NS_PER_S;
+            timeout->tv_usec = (time_left % AMQP_NS_PER_S) / AMQP_NS_PER_US;
+        }
+*/
+      }
     }
   }
 
@@ -82,13 +142,13 @@ start:
 }
 
 static ssize_t
-amqp_tcp_socket_send(void *base, const void *buf, size_t len)
+amqp_tcp_socket_send(void *base, const void *buf, size_t len, struct timeval *timeout)
 {
-  return amqp_tcp_socket_send_inner(base, buf, len, 0);
+  return amqp_tcp_socket_send_inner(base, buf, len, 0, timeout);
 }
 
 static ssize_t
-amqp_tcp_socket_writev(void *base, struct iovec *iov, int iovcnt)
+amqp_tcp_socket_writev(void *base, struct iovec *iov, int iovcnt, struct timeval *timeout)
 {
   struct amqp_tcp_socket_t *self = (struct amqp_tcp_socket_t *)base;
   ssize_t ret;
@@ -118,12 +178,12 @@ amqp_tcp_socket_writev(void *base, struct iovec *iov, int iovcnt)
     int i;
     for (i = 0; i < iovcnt - 1; ++i) {
       ret = amqp_tcp_socket_send_inner(self, iov[i].iov_base, iov[i].iov_len,
-                                       MSG_MORE);
+                                       MSG_MORE, NULL);
       if (ret != AMQP_STATUS_OK) {
         goto exit;
       }
     }
-    ret = amqp_tcp_socket_send_inner(self, iov[i].iov_base, iov[i].iov_len, 0);
+    ret = amqp_tcp_socket_send_inner(self, iov[i].iov_base, iov[i].iov_len, 0, NULL);
 
   exit:
     return ret;
@@ -204,7 +264,7 @@ amqp_tcp_socket_writev(void *base, struct iovec *iov, int iovcnt)
       bufferp += iov[i].iov_len;
     }
 
-    ret = amqp_tcp_socket_send_inner(self, self->buffer, bytes, 0);
+    ret = amqp_tcp_socket_send_inner(self, self->buffer, bytes, 0, NULL);
 
   exit:
     return ret;
@@ -213,7 +273,7 @@ amqp_tcp_socket_writev(void *base, struct iovec *iov, int iovcnt)
 }
 
 static ssize_t
-amqp_tcp_socket_recv(void *base, void *buf, size_t len, int flags)
+amqp_tcp_socket_recv(void *base, void *buf, size_t len, int flags, struct timeval *timeout)
 {
   struct amqp_tcp_socket_t *self = (struct amqp_tcp_socket_t *)base;
   ssize_t ret;
@@ -308,6 +368,8 @@ amqp_tcp_socket_new(amqp_connection_state_t state)
   }
   self->klass = &amqp_tcp_socket_class;
   self->sockfd = -1;
+  self->send_timeout = -1;
+  self->recv_timeout = -1;
 
   amqp_set_socket(state, (amqp_socket_t *)self);
 
@@ -323,4 +385,26 @@ amqp_tcp_socket_set_sockfd(amqp_socket_t *base, int sockfd)
   }
   self = (struct amqp_tcp_socket_t *)base;
   self->sockfd = sockfd;
+}
+
+void
+amqp_tcp_socket_set_send_timeout(amqp_socket_t *base, int timeout_ms)
+{
+  struct amqp_tcp_socket_t *self;
+  if (base->klass != &amqp_tcp_socket_class) {
+    amqp_abort("<%p> is not of type amqp_tcp_socket_t", base);
+  }
+  self = (struct amqp_tcp_socket_t *)base;
+  self->send_timeout = timeout_ms;
+}
+
+void
+amqp_tcp_socket_set_recv_timeout(amqp_socket_t *base, int timeout_ms)
+{
+  struct amqp_tcp_socket_t *self;
+  if (base->klass != &amqp_tcp_socket_class) {
+    amqp_abort("<%p> is not of type amqp_tcp_socket_t", base);
+  }
+  self = (struct amqp_tcp_socket_t *)base;
+  self->recv_timeout = timeout_ms;
 }

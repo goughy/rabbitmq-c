@@ -193,35 +193,45 @@ amqp_os_socket_close(int sockfd)
 }
 
 ssize_t
-amqp_socket_writev(amqp_socket_t *self, struct iovec *iov, int iovcnt)
+amqp_socket_writev_noblock(amqp_socket_t *self, struct iovec *iov, int iovcnt, struct timeval *timeout)
 {
   assert(self);
   assert(self->klass->writev);
-  return self->klass->writev(self, iov, iovcnt);
+  return self->klass->writev(self, iov, iovcnt, timeout);
+}
+
+ssize_t
+amqp_socket_writev(amqp_socket_t *self, struct iovec *iov, int iovcnt)
+{
+  return amqp_socket_writev_noblock(self, iov, iovcnt, NULL);
+}
+
+ssize_t
+amqp_socket_send_noblock(amqp_socket_t *self, const void *buf, size_t len, struct timeval *timeout)
+{
+  assert(self);
+  assert(self->klass->send);
+  return self->klass->send(self, buf, len, timeout);
 }
 
 ssize_t
 amqp_socket_send(amqp_socket_t *self, const void *buf, size_t len)
 {
+  return amqp_socket_send_noblock(self, buf, len, NULL);
+}
+
+ssize_t
+amqp_socket_recv_noblock(amqp_socket_t *self, void *buf, size_t len, int flags, struct timeval *timeout)
+{
   assert(self);
-  assert(self->klass->send);
-  return self->klass->send(self, buf, len);
+  assert(self->klass->recv);
+  return self->klass->recv(self, buf, len, flags, timeout);
 }
 
 ssize_t
 amqp_socket_recv(amqp_socket_t *self, void *buf, size_t len, int flags)
 {
-  assert(self);
-  assert(self->klass->recv);
-  return self->klass->recv(self, buf, len, flags);
-}
-
-int
-amqp_socket_open(amqp_socket_t *self, const char *host, int port)
-{
-  assert(self);
-  assert(self->klass->open);
-  return self->klass->open(self, host, port, NULL);
+  return amqp_socket_recv_noblock(self, buf, len, flags, NULL);
 }
 
 int
@@ -230,6 +240,12 @@ amqp_socket_open_noblock(amqp_socket_t *self, const char *host, int port, struct
   assert(self);
   assert(self->klass->open);
   return self->klass->open(self, host, port, timeout);
+}
+
+int
+amqp_socket_open(amqp_socket_t *self, const char *host, int port)
+{
+  return amqp_socket_open_noblock(self, host, port, NULL);
 }
 
 int
@@ -329,7 +345,6 @@ int amqp_open_socket_noblock(char const *hostname,
       continue;
     }
 
-    if (timeout) {
       /* Trying to connect with timeout, set socket to non-blocking mode */
       if (AMQP_STATUS_OK != amqp_os_socket_setsockblock(sockfd, 0)) {
         last_error = AMQP_STATUS_SOCKET_ERROR;
@@ -340,11 +355,6 @@ int amqp_open_socket_noblock(char const *hostname,
 
       if (0 == res) {
         /* Connected immediately, set to blocking mode again */
-        if (AMQP_STATUS_OK != amqp_os_socket_setsockblock(sockfd, 1)) {
-          last_error = AMQP_STATUS_SOCKET_ERROR;
-          continue;
-        }
-
         last_error = AMQP_STATUS_OK;
         break;
       }
@@ -357,21 +367,23 @@ int amqp_open_socket_noblock(char const *hostname,
 
         while(1) {
           struct pollfd pfd;
-          int timeout_ms;
+          int timeout_ms = -1;
 
           pfd.fd = sockfd;
           pfd.events = POLLERR | POLLOUT;
           pfd.revents = 0;
 
-          timer_error = amqp_timer_update(&timer, timeout);
+          if (timeout) {
+            timer_error = amqp_timer_update(&timer, timeout);
 
-          if (timer_error < 0) {
-            last_error = timer_error;
-            break;
+            if (timer_error < 0) {
+                last_error = timer_error;
+                break;
+            }
+
+            timeout_ms = timer.tv.tv_sec * AMQP_MS_PER_S +
+                timer.tv.tv_usec / AMQP_US_PER_MS;
           }
-
-          timeout_ms = timer.tv.tv_sec * AMQP_MS_PER_S +
-              timer.tv.tv_usec / AMQP_US_PER_MS;
           /* Win32 requires except_fds to be passed to detect connection
            * failure. Other platforms only need write_fds, passing except_fds
            * seems to be harmless otherwise
@@ -393,11 +405,6 @@ int amqp_open_socket_noblock(char const *hostname,
             }
 
             /* socket is ready to be written to, set to blocking mode again */
-            if (AMQP_STATUS_OK != amqp_os_socket_setsockblock(sockfd, 1)) {
-              last_error = AMQP_STATUS_SOCKET_ERROR;
-              continue;
-            }
-
             last_error = AMQP_STATUS_OK;
             break;
           } else if (0 == res) {
@@ -428,17 +435,7 @@ int amqp_open_socket_noblock(char const *hostname,
 
       }
 
-    } else {
-      /* Connect in blocking mode */
-      if (0 != connect(sockfd, addr->ai_addr, addr->ai_addrlen)) {
-        last_error = AMQP_STATUS_SOCKET_ERROR;
-        continue;
-      } else {
-        last_error = AMQP_STATUS_OK;
-        break;
-      }
     }
-  }
 
   freeaddrinfo(address_list);
   if (last_error != AMQP_STATUS_OK) {
@@ -551,71 +548,67 @@ static int consume_one_frame(amqp_connection_state_t state, amqp_frame_t *decode
 static int recv_with_timeout(amqp_connection_state_t state, uint64_t start, struct timeval *timeout)
 {
   int res;
-
-  if (timeout) {
+  int last_error;
     int fd;
 
     fd = amqp_get_sockfd(state);
     if (-1 == fd) {
       return AMQP_STATUS_CONNECTION_CLOSED;
     }
-
-    if (INT_MAX < (uint64_t)timeout->tv_sec * AMQP_MS_PER_S +
-        (uint64_t)timeout->tv_usec / AMQP_US_PER_MS) {
-      return AMQP_STATUS_INVALID_PARAMETER;
-    }
-
     while (1) {
       struct pollfd pfd;
-      int timeout_ms;
+      int timeout_ms = -1;
 
-      pfd.fd = fd;
-      pfd.events = POLLIN;
-      pfd.revents = 0;
-
-      timeout_ms = timeout->tv_sec * AMQP_MS_PER_S +
-          timeout->tv_usec / AMQP_US_PER_MS;
-
-      res = poll(&pfd, 1, timeout_ms);
-
-      if (0 < res) {
+      res = amqp_socket_recv(state->socket, state->sock_inbound_buffer.bytes,
+                         state->sock_inbound_buffer.len, 0);
+      if (res > 0) {
         break;
       } else if (0 == res) {
         return AMQP_STATUS_TIMEOUT;
-      } else if (-1 == res) {
-        if (EINTR == errno) {
-          if (timeout) {
-            uint64_t end_timestamp;
-            uint64_t time_left;
-            uint64_t current_timestamp = amqp_get_monotonic_timestamp();
-            if (0 == current_timestamp) {
-              return AMQP_STATUS_TIMER_FAILURE;
-            }
-            end_timestamp = start +
-              (uint64_t)timeout->tv_sec * AMQP_NS_PER_S +
-              (uint64_t)timeout->tv_usec * AMQP_NS_PER_US;
-            if (current_timestamp > end_timestamp) {
-              return AMQP_STATUS_TIMEOUT;
-            }
+      } else if (res < 0) {
+          if(AMQP_STATUS_SOCKET_ERROR == res) {
+            last_error = errno;
+            if (EWOULDBLOCK == last_error || EAGAIN == last_error) {
+                pfd.fd = fd;
+                pfd.events = POLLIN;
+                pfd.revents = 0;
 
-            time_left = end_timestamp - current_timestamp;
+                if (timeout) {
+                    timeout_ms = timeout->tv_sec * AMQP_MS_PER_S +
+                        timeout->tv_usec / AMQP_US_PER_MS;
+                }
+                res = poll(&pfd, 1, timeout_ms);
+                if (0 > res) {
+                  return AMQP_STATUS_SOCKET_ERROR;
+                } else if (0 == res) {
+                  return AMQP_STATUS_TIMEOUT;
+                }
 
-            timeout->tv_sec = time_left / AMQP_NS_PER_S;
-            timeout->tv_usec = (time_left % AMQP_NS_PER_S) / AMQP_NS_PER_US;
-          }
-          continue;
+                if (timeout) {
+                    uint64_t end_timestamp;
+                    uint64_t time_left;
+                    uint64_t current_timestamp = amqp_get_monotonic_timestamp();
+                    if (0 == current_timestamp) {
+                        return AMQP_STATUS_TIMER_FAILURE;
+                    }
+                    end_timestamp = start +
+                        (uint64_t)timeout->tv_sec * AMQP_NS_PER_S +
+                        (uint64_t)timeout->tv_usec * AMQP_NS_PER_US;
+                    if (current_timestamp > end_timestamp) {
+                        return AMQP_STATUS_TIMEOUT;
+                    }
+
+                    time_left = end_timestamp - current_timestamp;
+
+                    timeout->tv_sec = time_left / AMQP_NS_PER_S;
+                    timeout->tv_usec = (time_left % AMQP_NS_PER_S) / AMQP_NS_PER_US;
+                }
+                continue;
+            }
         }
         return AMQP_STATUS_SOCKET_ERROR;
       }
     }
-  }
-
-  res = amqp_socket_recv(state->socket, state->sock_inbound_buffer.bytes,
-                         state->sock_inbound_buffer.len, 0);
-
-  if (res < 0) {
-    return res;
-  }
 
   state->sock_inbound_limit = res;
   state->sock_inbound_offset = 0;
@@ -1386,3 +1379,4 @@ amqp_rpc_reply_t amqp_login_with_properties(amqp_connection_state_t state,
 
   return ret;
 }
+

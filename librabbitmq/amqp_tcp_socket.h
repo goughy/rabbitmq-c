@@ -68,6 +68,28 @@ void
 AMQP_CALL
 amqp_tcp_socket_set_sockfd(amqp_socket_t *self, int sockfd);
 
+/**
+ * Set the send timeout for a socket object.
+ *
+ * \param [in,out] self A TCP socket object.
+ * \param [in] timeout_ms The send timeout in ms.
+ */
+AMQP_PUBLIC_FUNCTION
+void
+AMQP_CALL
+amqp_tcp_socket_set_send_timeout(amqp_socket_t *self, int timeout_ms);
+
+/**
+ * Set the receive timeout for a socket object.
+ *
+ * \param [in,out] self A TCP socket object.
+ * \param [in] timeout_ms The send timeout in ms.
+ */
+AMQP_PUBLIC_FUNCTION
+void
+AMQP_CALL
+amqp_tcp_socket_set_recv_timeout(amqp_socket_t *self, int timeout_ms);
+
 AMQP_END_DECLS
 
 #endif /* AMQP_TCP_SOCKET_H */
