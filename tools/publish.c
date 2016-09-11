@@ -145,8 +145,9 @@ int main(int argc, const char **argv)
 
   if (headers) {
     int num = 0;
-    for (pos = headers; *pos; pos++)
+    for (pos = headers; *pos; pos++) {
       num++;
+    }
 
     if (num > 0) {
       amqp_table_t *table = &props.headers;
@@ -162,6 +163,9 @@ int main(int argc, const char **argv)
           table->entries[i].value.kind = AMQP_FIELD_KIND_UTF8;
           table->entries[i].value.value.bytes = amqp_cstring_bytes(colon);
           i++;
+        }
+        else {
+          fprintf(stderr, "Ignored header definition missing ':' delimiter in \"%s\"\n", *pos);
         }
       }
       props._flags |= AMQP_BASIC_HEADERS_FLAG;
